@@ -64,11 +64,43 @@ The endpoint is served by [`app/api/mcp/route.ts`](../app/api/mcp/route.ts),
 which builds its server from the canonical `createServer()` in
 [`lib/mcp/server.ts`](../lib/mcp/server.ts) shared with the stdio dev server
 and the `@stellarintel/mcp` package, so they cannot drift apart. Requests are
-rate-limited to 60 per minute per IP.
+rate-limited to 60 per minute per IP; keyed callers get their tier's limit
+instead (see below).
 
 **It serves ten tools** — the eight off-ramp and discovery tools plus the two
 on-ramp tools — alongside prompts and the anchor health ledger resource across
 all transports.
+
+### API keys, tiers and limits
+
+An agent that sends an API key is counted as that key, not as whichever IP its
+cloud egress happens to use. Keys are configured on the deployment with
+`MCP_API_KEYS`, a JSON object mapping each key to its identity:
+
+```bash
+MCP_API_KEYS='{"sk_live_abc":{"id":"agent-1","tier":"standard","scopes":["tools:read"],"maxIntentAmount":"100"}}'
+```
+
+`id` is the public identity used in logs and rate-limit keys — the raw key is
+never logged and never reaches tool handlers. Two tiers exist:
+
+| Tier                                 | Route limit (`api.mcp`) | Per-tool limit  |
+| ------------------------------------ | ----------------------- | --------------- |
+| `anonymous` (no key, or no tier set) | 60/min per IP           | 60/min per IP   |
+| `standard`                           | 300/min per key         | 300/min per key |
+
+A request with no `Authorization` header stays anonymous, so existing clients
+keep working unchanged. A request that presents a key is authenticated: a key
+that is not configured, or a non-Bearer `Authorization` header, is rejected
+with HTTP `401` and:
+
+```json
+{ "jsonrpc": "2.0", "error": { "code": -32001, "message": "Invalid API key" }, "id": null }
+```
+
+The response also carries
+`WWW-Authenticate: Bearer realm="stellar-intel", error="invalid_token"`.
+Stdio and self-hosted transports have no key store, so they remain anonymous.
 
 ## Running it yourself
 
