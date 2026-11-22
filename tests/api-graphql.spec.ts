@@ -23,7 +23,7 @@ vi.mock('@/lib/stellar/server-rates', () => ({
   })),
 }));
 
-import { POST } from '@/app/api/graphql/route';
+import { GET, POST } from '@/app/api/graphql/route';
 import { checkRateLimit, clearRateLimitStore } from '@/lib/api/rate-limit';
 import { clearRateCache } from '@/lib/api/rate-cache';
 
@@ -216,6 +216,48 @@ describe('POST /api/graphql — submitOfframpIntent', () => {
     });
     expect(result.data).toBeNull();
     expect(result.errors?.[0]?.extensions?.code).toBe('BAD_USER_INPUT');
+  });
+});
+
+describe('GET /api/graphql — mutations are POST-only', () => {
+  const MUTATION = `
+    mutation($input: OfframpIntentInput!) {
+      submitOfframpIntent(input: $input) { quoteId unsignedTx }
+    }
+  `;
+
+  const VALID_INPUT = {
+    sourceAsset: 'USDC',
+    destinationAsset: 'NGN',
+    amount: '100',
+    sender: VALID_SENDER,
+    recipient: 'NGN-BANK-ACCOUNT-123',
+  };
+
+  function getRequest(query: string, variables?: Record<string, unknown>): NextRequest {
+    const params = new URLSearchParams({ query });
+    if (variables) params.set('variables', JSON.stringify(variables));
+    return new NextRequest(`http://localhost/api/graphql?${params.toString()}`, { method: 'GET' });
+  }
+
+  it('rejects a mutation with 405 and does not execute it', async () => {
+    const res = await GET(getRequest(MUTATION, { input: VALID_INPUT }));
+    expect(res.status).toBe(405);
+    expect(res.headers.get('Allow')).toBe('POST');
+
+    const body = (await res.json()) as GraphQLResponse<{ submitOfframpIntent?: unknown }>;
+    expect(body.data).toBeNull();
+    expect(body.data?.submitOfframpIntent).toBeUndefined();
+    expect(body.errors?.[0]?.message).toBe('Mutations must be sent with POST');
+  });
+
+  it('still serves a query over GET', async () => {
+    const res = await GET(getRequest('{ anchors { id } }'));
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as GraphQLResponse<{ anchors: Array<{ id: string }> }>;
+    expect(body.errors).toBeUndefined();
+    expect(body.data?.anchors.length).toBeGreaterThan(0);
   });
 });
 
