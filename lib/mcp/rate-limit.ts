@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { IsomorphicHeaders } from '@modelcontextprotocol/sdk/types.js';
 import { checkRateLimit } from '@/lib/api/rate-limit';
 
@@ -34,6 +35,28 @@ export const RATE_LIMITED_ERROR_CODE = 'RATE_LIMITED';
 
 /** `_meta` key the structured payload is published under. */
 export const RATE_LIMITED_META_KEY = 'stellarintel/rateLimit';
+
+/** Tier of a keyed MCP caller (#2209). Anonymous callers have no key. */
+export type McpTier = 'anonymous' | 'standard';
+
+/**
+ * How much more a tier may spend than an anonymous caller. `standard` is a
+ * keyed agent; the multiplier is applied to every MCP limit the tier touches,
+ * including the route-level `api.mcp` bucket and each per-tool bucket.
+ */
+export const TIER_MULTIPLIER: Record<McpTier, number> = {
+  anonymous: 1,
+  standard: 5,
+};
+
+/** The limit for `tier`, given the anonymous base cap. */
+export function limitForTier(base: number, tier: McpTier): number {
+  return base * TIER_MULTIPLIER[tier];
+}
+
+function tierFromExtra(value: unknown): McpTier {
+  return value === 'standard' || value === 'anonymous' ? value : 'anonymous';
+}
 
 export interface RateLimitedErrorData {
   code: typeof RATE_LIMITED_ERROR_CODE;
@@ -74,8 +97,18 @@ function headerValue(headers: IsomorphicHeaders | undefined, name: string): stri
   return value?.trim() || undefined;
 }
 
+export interface McpRequestExtra {
+  sessionId?: string;
+  requestInfo?: { headers?: IsomorphicHeaders };
+  authInfo?: AuthInfo;
+}
+
 /**
  * Who to count a call against.
+ *
+ * A keyed caller wins over everything else: the key is the agent, and it must
+ * follow that agent across sessions and egress IPs (#2209). The route hands
+ * this through `authInfo.extra.rateLimitKey`.
  *
  * Streamable HTTP gives every client a session id, which is the right unit:
  * it survives across requests and is not shared between agents. Where there is
@@ -85,10 +118,10 @@ function headerValue(headers: IsomorphicHeaders | undefined, name: string): stri
  * subprocess of exactly one client, so "per-client" and "per-process" are the
  * same thing there, and the limit still bounds what that client can spend.
  */
-export function resolveClientId(extra: {
-  sessionId?: string;
-  requestInfo?: { headers?: IsomorphicHeaders };
-}): string {
+export function resolveClientId(extra: McpRequestExtra): string {
+  const keyed = extra.authInfo?.extra?.rateLimitKey;
+  if (typeof keyed === 'string' && keyed.startsWith('key:')) return keyed;
+
   if (extra.sessionId?.trim()) return `session:${extra.sessionId.trim()}`;
 
   const headers = extra.requestInfo?.headers;
@@ -124,15 +157,16 @@ export function applyToolRateLimit(server: McpServer, options: ToolRateLimitOpti
     const limited = async (...args: unknown[]) => {
       // The handler extra is always the last argument: (args, extra) for a tool
       // with an input schema, (extra) for one without.
-      const extra = args[args.length - 1] as {
-        sessionId?: string;
-        requestInfo?: { headers?: IsomorphicHeaders };
-      };
+      const extra = args[args.length - 1] as McpRequestExtra;
+      const effectiveMaxRequests = limitForTier(
+        maxRequests,
+        tierFromExtra(extra.authInfo?.extra?.tier)
+      );
 
       const result = await checkRateLimit(resolveClientId(extra), {
         bucket: `${MCP_TOOL_RATE_LIMIT_BUCKET}:${name}`,
         windowMs,
-        maxRequests,
+        maxRequests: effectiveMaxRequests,
       });
 
       if (!result.allowed) {

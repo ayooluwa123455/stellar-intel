@@ -3,6 +3,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { createServer } from '@/lib/mcp/server';
 import { checkRateLimit, getClientIp } from '@/lib/api/rate-limit';
+import { resolveCaller } from '@/lib/auth/mcp-caller';
+import { limitForTier } from '@/lib/mcp/rate-limit';
 import { getLogger } from '@/lib/logger';
 
 /**
@@ -29,14 +31,43 @@ import { getLogger } from '@/lib/logger';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const MCP_RATE_LIMIT = { bucket: 'api.mcp', maxRequests: 60 } as const;
+const MCP_RATE_LIMIT_BUCKET = 'api.mcp';
+const MCP_RATE_LIMIT_MAX = 60;
 
 export async function POST(request: NextRequest): Promise<Response> {
   const logger = getLogger('api.mcp');
   const ip = getClientIp(request.headers);
-  const rl = await checkRateLimit(ip, MCP_RATE_LIMIT);
+
+  // A keyed caller is counted as that key, not as whichever address its cloud
+  // egress happens to use (#2209). A request with no key stays anonymous, so
+  // existing clients keep working; a presented-but-invalid key is a 401.
+  const resolved = resolveCaller(request.headers);
+  if (!resolved.ok) {
+    logger.warn({ event: 'mcp_invalid_api_key', ip });
+    return NextResponse.json(
+      { jsonrpc: '2.0', error: { code: -32001, message: resolved.message }, id: null },
+      {
+        status: 401,
+        headers: {
+          'WWW-Authenticate': 'Bearer realm="stellar-intel", error="invalid_token"',
+        },
+      }
+    );
+  }
+  const caller = resolved.caller;
+
+  const rl = await checkRateLimit(caller.rateLimitKey, {
+    bucket: MCP_RATE_LIMIT_BUCKET,
+    maxRequests: limitForTier(MCP_RATE_LIMIT_MAX, caller.tier),
+  });
   if (!rl.allowed) {
-    logger.warn({ event: 'rate_limit_exceeded', ip, retryAfter: rl.retryAfter });
+    logger.warn({
+      event: 'rate_limit_exceeded',
+      ip,
+      caller: caller.id,
+      tier: caller.tier,
+      retryAfter: rl.retryAfter,
+    });
     return NextResponse.json(
       {
         jsonrpc: '2.0',
@@ -73,7 +104,23 @@ export async function POST(request: NextRequest): Promise<Response> {
     // With enableJsonResponse the returned Response carries a fully buffered
     // JSON body rather than an open SSE stream, so it is safe to close the
     // server once this resolves.
-    const response = await transport.handleRequest(request);
+    //
+    // `token` is deliberately empty: the SDK forwards authInfo to tool handlers
+    // as `extra.authInfo`, and they only need the identity, so the raw
+    // credential never reaches them (or a log line they might write).
+    const response = await transport.handleRequest(request, {
+      authInfo: {
+        token: '',
+        clientId: caller.id,
+        scopes: [...caller.scopes],
+        extra: {
+          kind: caller.kind,
+          tier: caller.tier,
+          rateLimitKey: caller.rateLimitKey,
+          maxIntentAmount: caller.maxIntentAmount,
+        },
+      },
+    });
     await server.close();
     server = undefined;
     return response;
